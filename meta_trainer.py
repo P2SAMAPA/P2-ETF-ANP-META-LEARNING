@@ -131,7 +131,7 @@ def train(
     # ── Training loop ─────────────────────────────────────────────────────────
     best_val_loss = float("inf")
     patience_cnt  = 0
-    history       = {"train_loss": [], "val_loss": [], "recon": [], "kl": []}
+    history       = {"train_loss": [], "val_loss": [], "recon": [], "kl": [], "rank_loss": []}
 
     idx_train = np.arange(len(train_tensors))
 
@@ -149,7 +149,7 @@ def train(
         # ── Train ─────────────────────────────────────────────────────────────
         model.train()
         rng.shuffle(idx_train)
-        train_losses, train_recons, train_kls = [], [], []
+        train_losses, train_recons, train_kls, train_ranks = [], [], [], []
 
         for b_start in range(0, len(train_tensors), config.BATCH_SIZE):
             b_idx  = idx_train[b_start: b_start + config.BATCH_SIZE]
@@ -171,6 +171,7 @@ def train(
             train_losses.append(info["loss"])
             train_recons.append(info["recon"])
             train_kls.append(info["kl"])
+            train_ranks.append(info["rank_loss"])
 
         scheduler.step()
 
@@ -191,21 +192,23 @@ def train(
                 loss, _ = elbo_loss(out, batch["query_y"], kl_weight=1.0)
                 val_losses.append(loss.item())
 
-        train_l = float(np.mean(train_losses))
-        val_l   = float(np.mean(val_losses))
-        recon_l = float(np.mean(train_recons))
-        kl_l    = float(np.mean(train_kls))
+        train_l  = float(np.mean(train_losses))
+        val_l    = float(np.mean(val_losses))
+        recon_l  = float(np.mean(train_recons))
+        kl_l     = float(np.mean(train_kls))
+        rank_l   = float(np.mean(train_ranks))
 
         history["train_loss"].append(train_l)
         history["val_loss"].append(val_l)
         history["recon"].append(recon_l)
         history["kl"].append(kl_l)
+        history["rank_loss"].append(rank_l)
 
         elapsed = time.time() - t0
         print(
             f"  Epoch {epoch:3d}/{n_epochs} | "
             f"train={train_l:.4f}  val={val_l:.4f}  "
-            f"recon={recon_l:.4f}  kl={kl_l:.4f}  "
+            f"recon={recon_l:.4f}  kl={kl_l:.4f}  rank={rank_l:.4f}  "
             f"kl_w={kl_weight:.2f}  lr={scheduler.get_last_lr()[0]:.2e}  "
             f"[{elapsed:.1f}s]"
         )
@@ -235,17 +238,22 @@ def train(
         "train_date":       config.TODAY,
         "best_val_loss":    best_val_loss,
         "config": {
-            "encoder_hidden":    config.ENCODER_HIDDEN,
-            "latent_dim":        config.LATENT_DIM,
-            "decoder_hidden":    config.DECODER_HIDDEN,
-            "n_heads":           config.N_HEADS,
-            "dropout":           config.DROPOUT,
-            "context_size":      config.CONTEXT_SIZE,
-            "query_size":        config.QUERY_SIZE,
-            "n_episodes":        n_episodes,
-            "n_epochs":          n_epochs,
-            "learning_rate":     config.LEARNING_RATE,
-            "meta_train_end":    config.META_TRAIN_END,
+            "encoder_hidden":     config.ENCODER_HIDDEN,
+            "latent_dim":         config.LATENT_DIM,
+            "decoder_hidden":     config.DECODER_HIDDEN,
+            "n_heads":            config.N_HEADS,
+            "dropout":            config.DROPOUT,
+            "context_size":       config.CONTEXT_SIZE,
+            "query_size":         config.QUERY_SIZE,
+            "n_episodes":         n_episodes,
+            "n_epochs":           n_epochs,
+            "learning_rate":      config.LEARNING_RATE,
+            "meta_train_end":     config.META_TRAIN_END,
+            "sharpe_weight_recon":config.SHARPE_WEIGHT_RECON,
+            "sharpe_weight_min":  config.SHARPE_WEIGHT_MIN,
+            "sharpe_weight_max":  config.SHARPE_WEIGHT_MAX,
+            "rank_loss_wt":       config.RANK_LOSS_WT,
+            "rank_temp_target":   config.RANK_TEMP_TARGET,
         },
     }
 
