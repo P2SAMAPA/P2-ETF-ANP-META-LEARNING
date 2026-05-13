@@ -18,9 +18,19 @@ Architecture
               │  Decoder                   │  f(x_query, r_agg, z) → mu_y, log_sigma_y
               └────────────────────────────┘
 
-Loss (ELBO)
+Loss (ELBO + Fix1 + Fix2)
 -----------
-  L = E_q[log p(y_query | x_query, context)] − KL[q(z|context,target) || p(z|context)]
+  L = Sharpe-weighted_recon + kl_weight * KL + RANK_LOSS_WT * ListNet_rank
+
+  Fix 1 — Sharpe-weighted reconstruction:
+    Per-ETF weight w_i = clip(1 + |Sharpe_i|, MIN, MAX)
+    Upweights high-return episodes so model seeks high-return ETFs.
+
+  Fix 2 — ListNet cross-sectional ranking loss:
+    p_pred = softmax(mu_pred / RANK_TEMP_PRED)       across ETFs
+    p_tgt  = softmax(target_mean / RANK_TEMP_TARGET) across ETFs (sharp)
+    rank_loss = KL(p_tgt || p_pred)
+    Directly teaches cross-sectional ranking, not just level accuracy.
 
   During training:
     p(z|context)         = N(mu_z_ctx, sigma_z_ctx)   ← only context
@@ -290,44 +300,117 @@ class AttentiveNeuralProcess(nn.Module):
         return mu_mean, mu_std
 
 
-# ── ELBO loss ─────────────────────────────────────────────────────────────────
+# ── Fix 2: ListNet cross-sectional ranking loss ──────────────────────────────
+
+def ranking_loss(
+    mu_y: torch.Tensor,       # (B, Q, y_dim) — predicted returns
+    target_y: torch.Tensor,   # (B, Q, y_dim) — realised returns
+) -> torch.Tensor:
+    """ListNet cross-sectional ranking loss (Cao et al., 2007).
+
+    Treats each ETF (y_dim axis) as an item to rank. For each query day,
+    computes a soft probability distribution over ETF ranks from both
+    predicted and target returns, then minimises their KL divergence.
+
+    This directly teaches the model to get the cross-sectional ETF rank
+    right — not just minimise prediction error at the level of each ETF.
+
+    L_rank = mean over batch and query days of:
+        KL(p_target || p_pred)
+      where:
+        p_pred   = softmax(mu_mean / RANK_TEMP_PRED)    across ETFs
+        p_target = softmax(tgt_mean / RANK_TEMP_TARGET) across ETFs
+
+    RANK_TEMP_TARGET is very small (0.005) → near-one-hot distribution
+    heavily concentrating weight on the best-performing ETF → pushes
+    the model to identify the top ETF, not just get average returns right.
+    """
+    # Collapse Q dimension → mean return per ETF per batch element
+    mu_mean  = mu_y.mean(dim=1)      # (B, y_dim)
+    tgt_mean = target_y.mean(dim=1)  # (B, y_dim)
+
+    # Soft rank distributions over ETFs
+    p_pred   = torch.softmax(mu_mean  / config.RANK_TEMP_PRED,   dim=-1)  # (B, y_dim)
+    p_target = torch.softmax(tgt_mean / config.RANK_TEMP_TARGET, dim=-1)  # (B, y_dim) — sharp
+
+    # KL(p_target || p_pred) — target is the "truth" distribution
+    # KL = sum p_target * log(p_target / p_pred)
+    kl_rank = (p_target * (torch.log(p_target + 1e-8) - torch.log(p_pred + 1e-8)))
+    return kl_rank.sum(dim=-1).mean()  # scalar
+
+
+# ── ELBO loss with Fix 1 (Sharpe weighting) and Fix 2 (ranking) ───────────────
 
 def elbo_loss(
     out: dict,
     target_y: torch.Tensor,
     kl_weight: float = 1.0,
 ) -> tuple[torch.Tensor, dict]:
-    """Evidence Lower BOund loss for ANP.
+    """ELBO + Sharpe-weighted reconstruction (Fix 1) + ListNet ranking (Fix 2).
 
-    L = -E[log p(y|x,z)] + kl_weight * KL[q(z|ctx+tgt) || p(z|ctx)]
+    Total loss:
+      L = sharpe_weighted_recon
+        + kl_weight * KL[q(z|ctx+tgt) || p(z|ctx)]
+        + RANK_LOSS_WT * ListNet_ranking_loss
 
-    Reconstruction: Gaussian log-likelihood of target_y under predicted dist.
-    KL:             Analytic KL between two Gaussians.
+    Fix 1 — Sharpe-weighted reconstruction
+    ---------------------------------------
+    Per-ETF Sharpe ratio computed from the query target batch:
+      sharpe_i = mean(y_i) / (std(y_i) + eps)         over Q query days
+      weight_i = clip(1 + |sharpe_i|, MIN, MAX)        in [1.0, 3.0]
+
+    High-Sharpe ETFs (high return relative to their own volatility) get
+    up to 3× more gradient weight. This biases the model to predict
+    high-return stable ETFs accurately — directly addressing the FI bias.
+
+    Fix 2 — ListNet cross-sectional ranking loss
+    --------------------------------------------
+    See ranking_loss() above. Added with weight RANK_LOSS_WT = 0.30.
     """
-    mu_y      = out["mu_y"]           # (B, Q, y_dim)
+    mu_y      = out["mu_y"]       # (B, Q, y_dim)
     log_sig_y = out["log_sig_y"]
     sig_y     = torch.exp(0.5 * log_sig_y) + 1e-6
 
-    # Reconstruction loss: negative Gaussian log-likelihood
-    dist      = torch.distributions.Normal(mu_y, sig_y)
-    log_p     = dist.log_prob(target_y)           # (B, Q, y_dim)
-    recon     = -log_p.mean()
+    # ── Fix 1: Sharpe-weighted reconstruction ─────────────────────────────────
+    if config.SHARPE_WEIGHT_RECON:
+        # Per-ETF Sharpe over the Q query days in this batch
+        t_mean   = target_y.mean(dim=1, keepdim=True)         # (B, 1, y_dim)
+        t_std    = target_y.std(dim=1, keepdim=True) + 1e-6   # (B, 1, y_dim)
+        sharpe   = (t_mean / t_std).abs()                     # (B, 1, y_dim)
+        # Weight: 1 + |Sharpe|, clipped to [MIN, MAX]
+        w = torch.clamp(
+            1.0 + sharpe,
+            config.SHARPE_WEIGHT_MIN,
+            config.SHARPE_WEIGHT_MAX,
+        )                                                      # (B, 1, y_dim)
+    else:
+        w = 1.0
 
-    # KL divergence: analytic between two Gaussians
-    mu_q      = out["mu_post"]
-    sig_q     = torch.exp(0.5 * out["log_sig_post"]) + 1e-6
-    mu_p      = out["mu_prior"]
-    sig_p     = torch.exp(0.5 * out["log_sig_prior"]) + 1e-6
+    # Reconstruction: Sharpe-weighted negative Gaussian log-likelihood
+    dist  = torch.distributions.Normal(mu_y, sig_y)
+    log_p = dist.log_prob(target_y)      # (B, Q, y_dim)
+    recon = -(log_p * w).mean()          # scalar — weighted mean
+
+    # ── KL divergence (analytic, two Gaussians) ───────────────────────────────
+    mu_q  = out["mu_post"]
+    sig_q = torch.exp(0.5 * out["log_sig_post"]) + 1e-6
+    mu_p  = out["mu_prior"]
+    sig_p = torch.exp(0.5 * out["log_sig_prior"]) + 1e-6
 
     kl = torch.distributions.kl_divergence(
         torch.distributions.Normal(mu_q, sig_q),
         torch.distributions.Normal(mu_p, sig_p),
     ).mean()
 
-    loss = recon + kl_weight * kl
+    # ── Fix 2: ListNet cross-sectional ranking loss ───────────────────────────
+    rank_l = ranking_loss(mu_y, target_y)
+
+    # ── Total loss ────────────────────────────────────────────────────────────
+    loss = recon + kl_weight * kl + config.RANK_LOSS_WT * rank_l
 
     return loss, {
-        "loss":   loss.item(),
-        "recon":  recon.item(),
-        "kl":     kl.item(),
+        "loss":      loss.item(),
+        "recon":     recon.item(),
+        "kl":        kl.item(),
+        "rank_loss": rank_l.item(),
     }
