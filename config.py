@@ -83,6 +83,21 @@ PATIENCE           = 15             # early stopping patience (val loss)
 LR_SCHEDULER_STEP  = 20            # StepLR: decay LR every N epochs
 LR_SCHEDULER_GAMMA = 0.5           # StepLR: multiply LR by this factor
 
+# ── Fix 1: Sharpe-weighted reconstruction loss ────────────────────────────────
+# Upweights episodes where target ETFs have high Sharpe ratios so the model
+# pays more attention to getting high-return, high-signal episodes right.
+SHARPE_WEIGHT_RECON = True   # enable Sharpe-weighted reconstruction
+SHARPE_WEIGHT_MIN   = 1.0    # minimum per-ETF weight (no downweighting)
+SHARPE_WEIGHT_MAX   = 3.0    # maximum per-ETF weight (cap for stability)
+SHARPE_TEMP         = 0.01   # Sharpe sharpening temperature
+
+# ── Fix 2: Cross-sectional ranking auxiliary loss ─────────────────────────────
+# ListNet loss: directly teaches the model to rank ETFs correctly
+# cross-sectionally, not just minimise reconstruction error.
+RANK_LOSS_WT        = 0.30   # weight on ranking loss relative to ELBO
+RANK_TEMP_PRED      = 1.0    # softmax temperature for predicted returns
+RANK_TEMP_TARGET    = 0.005  # softmax temperature for target returns (sharp labels)
+
 # ── Inference / scoring ───────────────────────────────────────────────────────
 N_LATENT_SAMPLES   = 50    # MC samples from z for uncertainty estimation
 UNCERTAINTY_WT     = 1.0   # score = mu / (1 + UNCERTAINTY_WT * sigma)
