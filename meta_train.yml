@@ -1,0 +1,67 @@
+name: ANP Meta-Training (Manual)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Run this MANUALLY when you want to retrain the ANP model.
+# Recommended: weekly, or after any major regime change.
+#
+# Triggers: GitHub UI → Actions → "ANP Meta-Training (Manual)" → Run workflow
+#           OR: gh workflow run meta_train.yml
+#
+# Runtime: ~45-90 min on CPU (ubuntu-latest) per universe.
+#          Set timeout-minutes accordingly.
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  workflow_dispatch:
+    inputs:
+      universe:
+        description: "Universe to train (ALL / EQUITY_SECTORS / FI_COMMODITIES / COMBINED)"
+        required: false
+        default: "ALL"
+      epochs:
+        description: "Number of training epochs (default: 80)"
+        required: false
+        default: "80"
+      episodes:
+        description: "Number of meta-training episodes (default: 3000)"
+        required: false
+        default: "3000"
+
+jobs:
+  meta-train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360      # 6 hours — MLE on full dataset per universe
+
+    strategy:
+      matrix:
+        # Each universe trains independently in parallel
+        universe: [EQUITY_SECTORS, FI_COMMODITIES, COMBINED]
+      fail-fast: false        # don't cancel other universes if one fails
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run ANP meta-training — ${{ matrix.universe }}
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python meta_trainer.py \
+            --universe ${{ matrix.universe }} \
+            --epochs   ${{ github.event.inputs.epochs || '80' }} \
+            --episodes ${{ github.event.inputs.episodes || '3000' }}
+
+      - name: Report
+        if: always()
+        run: |
+          echo "Meta-training complete for ${{ matrix.universe }}"
+          echo "Checkpoint pushed to HF model repo: ${{ env.HF_MODEL_REPO || 'P2SAMAPA/p2-etf-anp-model' }}"

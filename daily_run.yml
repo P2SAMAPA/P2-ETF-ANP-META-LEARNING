@@ -1,0 +1,50 @@
+name: ANP Daily Inference
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Runs automatically Mon-Fri after US market close.
+# Loads the latest trained checkpoint from HF model repo.
+# Pushes daily scores/rankings to HF dataset repo.
+#
+# Requires: HF_TOKEN secret set in GitHub repo settings.
+# Requires: Checkpoint already exists in HF model repo
+#           (run meta_train.yml first if starting fresh).
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  schedule:
+    - cron: "15 22 * * 1-5"    # 22:15 UTC Mon–Fri (after US market close + buffer)
+  workflow_dispatch:
+    inputs:
+      universe:
+        description: "Universe to score (ALL / EQUITY_SECTORS / FI_COMMODITIES / COMBINED)"
+        required: false
+        default: "ALL"
+
+jobs:
+  daily-inference:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30        # inference is fast — single forward pass per day
+
+    strategy:
+      matrix:
+        universe: [EQUITY_SECTORS, FI_COMMODITIES, COMBINED]
+      fail-fast: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run ANP inference — ${{ matrix.universe }}
+        env:
+          HF_TOKEN:     ${{ secrets.HF_TOKEN }}
+          ANP_UNIVERSE: ${{ matrix.universe }}
+        run: python trainer.py
