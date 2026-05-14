@@ -12,7 +12,7 @@ name: ANP Daily Inference
 
 on:
   schedule:
-    - cron: "15 22 * * 1-5"    # 22:15 UTC Mon–Fri (after US market close + buffer)
+    - cron: "15 00 * * 1-5"    # 22:15 UTC Mon–Fri (after US market close + buffer)
   workflow_dispatch:
     inputs:
       universe:
