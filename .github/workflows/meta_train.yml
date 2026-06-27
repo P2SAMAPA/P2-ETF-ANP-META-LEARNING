@@ -21,11 +21,11 @@ on:
       epochs:
         description: "Number of training epochs (default: 80)"
         required: false
-        default: "80"
+        default: "100"
       episodes:
         description: "Number of meta-training episodes (default: 3000)"
         required: false
-        default: "3000"
+        default: "5000"
 
 jobs:
   meta-train:
