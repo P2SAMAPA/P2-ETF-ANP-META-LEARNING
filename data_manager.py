@@ -69,11 +69,10 @@ def build_features(
     avail = [t for t in tickers if t in log_returns.columns]
     n_etf = len(avail)
     
-    # CRITICAL FIX: Get the date range where ALL ETFs have data
-    # First, find the minimum date where ALL ETFs have non-NaN data
-    ret = log_returns[avail]
+    # CRITICAL FIX: Only use dates where ALL ETFs in this universe have data
+    ret = log_returns[avail].copy()
     
-    # Find rows where all ETFs have data
+    # Find rows where all ETFs have non-NaN data
     valid_mask = ret.notna().all(axis=1)
     ret = ret[valid_mask]
     
@@ -84,35 +83,40 @@ def build_features(
     mac = (mac - mac.mean()) / (mac.std() + 1e-8)
 
     max_lag = max(config.LOOKBACK_LAGS + [config.ROLLING_MOM_WINDOW])
-    # Use max_lag as start to ensure we have enough history for rolling windows
     start = max_lag
 
     feature_rows, target_rows, dates = [], [], []
+
+    # Pre-calculate expected feature length for validation
+    n_features_per_etf = len(config.LOOKBACK_LAGS) + 2  # lags + vol + mom
+    n_macro_features = len(mac.columns)
+    expected_len = n_etf * n_features_per_etf + n_macro_features
 
     for t in range(start, len(ret)):
         row_feats = []
         
         # Process each ETF
         for tkr in avail:
-            # Get the series for this ETF
+            # Get the series for this ETF as numpy array for reliable indexing
             r_series = ret[tkr].values
+            n_samples = len(r_series)
             
-            # Ensure we have enough data
-            if t >= len(r_series):
-                continue
-                
             # Lagged returns - use zeros if not enough history
             for lag in config.LOOKBACK_LAGS:
                 idx = t - lag
-                if idx >= 0 and idx < len(r_series) and not np.isnan(r_series[idx]):
-                    row_feats.append(float(r_series[idx]))
+                if idx >= 0 and idx < n_samples:
+                    val = r_series[idx]
+                    if not np.isnan(val):
+                        row_feats.append(float(val))
+                    else:
+                        row_feats.append(0.0)
                 else:
                     row_feats.append(0.0)
 
             # Rolling volatility
             vol_start = max(0, t - config.ROLLING_VOL_WINDOW)
             vol_window = r_series[vol_start:t]
-            if len(vol_window) > 1:
+            if len(vol_window) > 1 and not np.isnan(vol_window).any():
                 row_feats.append(float(vol_window.std()))
             else:
                 row_feats.append(0.0)
@@ -120,7 +124,7 @@ def build_features(
             # Rolling momentum (annualised)
             mom_start = max(0, t - config.ROLLING_MOM_WINDOW)
             mom_window = r_series[mom_start:t]
-            if len(mom_window) > 1:
+            if len(mom_window) > 1 and not np.isnan(mom_window).any():
                 row_feats.append(float(mom_window.mean()) * 252)
             else:
                 row_feats.append(0.0)
@@ -128,25 +132,24 @@ def build_features(
         # Add macro features
         if t < len(mac):
             mac_row = mac.iloc[t].values.tolist()
+            # Ensure macro values are floats and not NaN
+            mac_row = [0.0 if np.isnan(x) else float(x) for x in mac_row]
             row_feats.extend(mac_row)
-        else:
-            # Should not happen, but just in case
-            row_feats.extend([0.0] * len(mac.columns))
 
         # Add target (returns for all ETFs at time t)
         if t < len(ret):
             target_row = ret.iloc[t].values.tolist()
+            # Ensure no NaN in targets
+            target_row = [0.0 if np.isnan(x) else float(x) for x in target_row]
         else:
-            target_row = [0.0] * len(avail)
+            target_row = [0.0] * n_etf
 
         # Verify row length is consistent
-        expected_len = len(avail) * (len(config.LOOKBACK_LAGS) + 2) + len(mac.columns)
         if len(row_feats) != expected_len:
-            print(f"WARNING: Row {t} has {len(row_feats)} features, expected {expected_len}")
             # Pad or truncate to expected length
             if len(row_feats) < expected_len:
                 row_feats.extend([0.0] * (expected_len - len(row_feats)))
-            else:
+            elif len(row_feats) > expected_len:
                 row_feats = row_feats[:expected_len]
 
         feature_rows.append(row_feats)
