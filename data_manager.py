@@ -92,19 +92,23 @@ def build_features(
     n_macro_features = len(mac.columns)
     expected_len = n_etf * n_features_per_etf + n_macro_features
 
-    for t in range(start, len(ret)):
+    # Convert to numpy arrays for faster and more reliable indexing
+    ret_values = ret.values  # Shape: (n_dates, n_etf)
+    mac_values = mac.values  # Shape: (n_dates, n_macro)
+    dates_idx = ret.index
+
+    for t in range(start, len(ret_values)):
         row_feats = []
         
         # Process each ETF
-        for tkr in avail:
-            # Get the series for this ETF as numpy array for reliable indexing
-            r_series = ret[tkr].values
-            n_samples = len(r_series)
+        for etf_idx in range(n_etf):
+            # Get the series for this ETF as numpy array
+            r_series = ret_values[:, etf_idx]
             
-            # Lagged returns - use zeros if not enough history
+            # Lagged returns
             for lag in config.LOOKBACK_LAGS:
                 idx = t - lag
-                if idx >= 0 and idx < n_samples:
+                if idx >= 0:
                     val = r_series[idx]
                     if not np.isnan(val):
                         row_feats.append(float(val))
@@ -116,29 +120,39 @@ def build_features(
             # Rolling volatility
             vol_start = max(0, t - config.ROLLING_VOL_WINDOW)
             vol_window = r_series[vol_start:t]
-            if len(vol_window) > 1 and not np.isnan(vol_window).any():
-                row_feats.append(float(vol_window.std()))
+            if len(vol_window) > 1:
+                # Check if any NaN in window
+                if not np.isnan(vol_window).any():
+                    row_feats.append(float(np.std(vol_window)))
+                else:
+                    row_feats.append(0.0)
             else:
                 row_feats.append(0.0)
 
             # Rolling momentum (annualised)
             mom_start = max(0, t - config.ROLLING_MOM_WINDOW)
             mom_window = r_series[mom_start:t]
-            if len(mom_window) > 1 and not np.isnan(mom_window).any():
-                row_feats.append(float(mom_window.mean()) * 252)
+            if len(mom_window) > 1:
+                if not np.isnan(mom_window).any():
+                    row_feats.append(float(np.mean(mom_window)) * 252)
+                else:
+                    row_feats.append(0.0)
             else:
                 row_feats.append(0.0)
 
         # Add macro features
-        if t < len(mac):
-            mac_row = mac.iloc[t].values.tolist()
-            # Ensure macro values are floats and not NaN
-            mac_row = [0.0 if np.isnan(x) else float(x) for x in mac_row]
-            row_feats.extend(mac_row)
+        if t < len(mac_values):
+            mac_row = mac_values[t]
+            # Ensure all macro values are valid floats
+            for val in mac_row:
+                if not np.isnan(val):
+                    row_feats.append(float(val))
+                else:
+                    row_feats.append(0.0)
 
         # Add target (returns for all ETFs at time t)
-        if t < len(ret):
-            target_row = ret.iloc[t].values.tolist()
+        if t < len(ret_values):
+            target_row = ret_values[t]
             # Ensure no NaN in targets
             target_row = [0.0 if np.isnan(x) else float(x) for x in target_row]
         else:
@@ -154,7 +168,7 @@ def build_features(
 
         feature_rows.append(row_feats)
         target_rows.append(target_row)
-        dates.append(ret.index[t])
+        dates.append(dates_idx[t])
 
     # Convert to numpy arrays
     X = np.array(feature_rows, dtype=np.float32)
