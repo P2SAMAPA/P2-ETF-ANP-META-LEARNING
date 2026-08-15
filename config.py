@@ -35,7 +35,7 @@ HF_TOKEN       = os.environ.get("HF_TOKEN", None)
 # ── Universes ─────────────────────────────────────────────────────────────────
 EQUITY_SECTORS_TICKERS = [
     "SPY", "QQQ", "XLK", "XLF", "XLE", "XLV", "XLB", "URA", "VUG", "VTV", "SPYG", "IWR", "VO", "VB", "VIG", "VEA", "VGT", "VDE", "XLC", "IBB",
-    "XLI", "XLY", "XLP", "XLU", "GDX", "XME", "SMH", "SOXX", "IWD", "IWO", "VUG", VTG", "SPYG", "QUAL", "IWR", "VO", "VB", "VIG", "VEA", "VGT", "VDE", "XLC",
+    "XLI", "XLY", "XLP", "XLU", "GDX", "XME", "SMH", "SOXX", "IWD", "IWO", "VUG", "VTG", "SPYG", "QUAL", "IWR", "VO", "VB", "VIG", "VEA", "VGT", "VDE", "XLC",
     "IWF", "XSD", "XBI", "IWM",
 ]
 FI_COMMODITIES_TICKERS = ["TLT", "VCIT", "LQD", "HYG", "VNQ", "GLD", "SLV"]
