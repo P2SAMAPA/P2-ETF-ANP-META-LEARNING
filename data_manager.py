@@ -1,224 +1,191 @@
-"""
-data_manager.py - Data loading, preprocessing, and feature engineering for ANP meta-training
-"""
+"""data_manager.py — Data loading and feature engineering for ANP engine."""
 
-import pandas as pd
+from __future__ import annotations
+
 import numpy as np
-from datetime import datetime, timedelta
-import yfinance as yf
-from typing import Tuple, Optional, List
-import logging
-from us_calendar import US_TradingCalendar
+import pandas as pd
+from huggingface_hub import hf_hub_download
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+import config
 
-class DataManager:
-    def __init__(self, config):
-        self.config = config
-        self.calendar = US_TradingCalendar()
-        self.etf_universe = config.ETFS_MASTER
-        self.macro_tickers = config.MACRO_TICKERS
-        self.start_date = config.START_DATE
-        self.end_date = config.END_DATE
-        
-    def load_data(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """
-        Load ETF price data and macro indicators.
-        Handles ETFs with different trading histories by aligning to common dates.
-        """
-        logger.info(f"Loading data for {len(self.etf_universe)} ETFs...")
-        
-        # Load ETF data
-        etf_data = {}
-        for ticker in self.etf_universe:
-            try:
-                df = yf.download(
-                    ticker, 
-                    start=self.start_date, 
-                    end=self.end_date,
-                    progress=False,
-                    auto_adjust=True
-                )
-                if not df.empty:
-                    etf_data[ticker] = df['Close']
-                    logger.debug(f"Loaded {ticker}: {len(df)} days")
-                else:
-                    logger.warning(f"No data for {ticker}")
-            except Exception as e:
-                logger.error(f"Error loading {ticker}: {e}")
-        
-        # Combine ETF data
-        etf_df = pd.DataFrame(etf_data)
-        
-        # Load macro data
-        macro_data = {}
-        for ticker in self.macro_tickers:
-            try:
-                df = yf.download(
-                    ticker,
-                    start=self.start_date,
-                    end=self.end_date,
-                    progress=False,
-                    auto_adjust=True
-                )
-                if not df.empty:
-                    macro_data[ticker] = df['Close']
-            except Exception as e:
-                logger.error(f"Error loading macro {ticker}: {e}")
-        
-        macro_df = pd.DataFrame(macro_data)
-        
-        # CRITICAL FIX: Align all data to common dates where ALL ETFs and macros have data
-        # This handles ETFs with shorter trading histories
-        logger.info("Aligning data to common dates...")
-        
-        # Combine all data
-        combined = etf_df.join(macro_df, how='inner')
-        
-        # Drop rows where ANY column has missing data
-        # This ensures every date has complete data for ALL ETFs and macros
-        combined = combined.dropna()
-        
-        # Split back into ETF and macro dataframes
-        aligned_etf_df = combined[self.etf_universe]
-        aligned_macro_df = combined[self.macro_tickers]
-        
-        logger.info(f"Aligned data: {len(aligned_etf_df)} common dates")
-        logger.info(f"Date range: {aligned_etf_df.index[0]} to {aligned_etf_df.index[-1]}")
-        
-        # Calculate returns
-        log_returns = np.log(aligned_etf_df / aligned_etf_df.shift(1)).dropna()
-        
-        return log_returns, aligned_macro_df
+ALL_TICKERS = sorted(set(
+    config.EQUITY_SECTORS_TICKERS + config.FI_COMMODITIES_TICKERS
+))
+
+
+def load_data(token: str | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Download master_data.parquet → (log_returns, macro_df)."""
+    file_path = hf_hub_download(
+        repo_id=config.HF_DATA_REPO,
+        filename=config.HF_DATA_FILE,
+        repo_type="dataset",
+        token=token,
+        cache_dir="./hf_cache",
+    )
+    df = pd.read_parquet(file_path)
+    if isinstance(df.index, pd.DatetimeIndex):
+        df = df.reset_index().rename(columns={"index": "Date"})
+    df["Date"] = pd.to_datetime(df["Date"])
+    df = df.sort_values("Date").reset_index(drop=True).set_index("Date")
+
+    available   = [t for t in ALL_TICKERS if t in df.columns]
+    prices      = df[available].ffill()
+    log_returns = np.log(prices / prices.shift(1)).dropna()
+
+    macro_cols = [c for c in config.MACRO_COLS if c in df.columns]
+    macro_df   = df[macro_cols].reindex(log_returns.index).ffill().fillna(0.0)
+
+    print(
+        f"Loaded {len(log_returns)} rows × {len(log_returns.columns)} ETFs"
+        f" | Macro: {macro_cols}"
+    )
+    return log_returns, macro_df
+
+
+def build_features(
+    log_returns: pd.DataFrame,
+    macro_df: pd.DataFrame,
+    tickers: list[str],
+) -> tuple[np.ndarray, np.ndarray, pd.DatetimeIndex]:
+    """Build feature matrix X and target matrix Y aligned by date.
+
+    Features (X) for day t — concatenation of:
+      - Lagged returns: r_{t-1}, r_{t-5}, r_{t-21}  for each ETF
+      - Rolling vol:    std(r_{t-21:t})              for each ETF
+      - Rolling mom:    mean(r_{t-63:t}) * 252       for each ETF
+      - Macro values:   VIX, DXY, T10Y2Y, TBILL_3M  (z-scored)
+
+    Target (Y) for day t:
+      - r_t (same-day log return) for each ETF in `tickers`
+      - This is what the context pairs teach the model about this regime day
+
+    Returns
+    -------
+    X     : (T, n_features) float32
+    Y     : (T, n_etf)      float32  — targets aligned to X rows
+    dates : DatetimeIndex length T
+    """
+    # Filter to available tickers
+    avail = [t for t in tickers if t in log_returns.columns]
+    n_etf = len(avail)
     
-    def build_features(
-        self, 
-        log_returns: pd.DataFrame, 
-        macro_df: pd.DataFrame,
-        avail: Optional[pd.DataFrame] = None
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """
-        Build feature matrix X and target matrix Y for ANP training.
-        
-        Args:
-            log_returns: DataFrame of log returns for all ETFs
-            macro_df: DataFrame of macro indicators
-            avail: Optional availability mask (not used in current version)
-            
-        Returns:
-            X: Feature matrix [n_samples, n_features]
-            Y: Target matrix [n_samples, n_etfs]
-            dates: Array of dates
-        """
-        logger.info("Building features...")
-        
-        # Ensure data is aligned
-        common_idx = log_returns.index.intersection(macro_df.index)
-        log_returns = log_returns.loc[common_idx]
-        macro_df = macro_df.loc[common_idx]
-        
-        # Create feature rows
-        feature_rows = []
-        target_rows = []
-        valid_dates = []
-        
-        context_size = self.config.CONTEXT_SIZE
-        # We need context_size + query_size samples for each episode
-        # For feature building, we create sliding windows
-        
-        for i in range(context_size, len(log_returns)):
-            # Get date for this sample
-            current_date = log_returns.index[i]
-            
-            # Get context window (last 21 days of returns and macros)
-            context_returns = log_returns.iloc[i-context_size:i].values  # [21, n_etfs]
-            context_macro = macro_df.iloc[i-context_size:i].values  # [21, n_macros]
-            
-            # Flatten context: ETF returns (21*42) + macro indicators (21*4)
-            # This creates a consistent feature vector regardless of ETF history
-            flat_features = np.concatenate([
-                context_returns.flatten(),  # 21 * n_etfs
-                context_macro.flatten()     # 21 * n_macros
-            ])
-            
-            # Target: next day returns for all ETFs (should all be available)
-            target = log_returns.iloc[i].values  # [n_etfs]
-            
-            # Check for any NaN values (shouldn't happen after alignment)
-            if np.isnan(flat_features).any() or np.isnan(target).any():
-                logger.warning(f"NaN found at date {current_date}, skipping")
-                continue
-            
-            feature_rows.append(flat_features)
-            target_rows.append(target)
-            valid_dates.append(current_date)
-        
-        # Convert to numpy arrays
-        try:
-            X = np.array(feature_rows, dtype=np.float32)
-            Y = np.array(target_rows, dtype=np.float32)
-            dates = np.array(valid_dates)
-            
-            logger.info(f"Feature matrix shape: {X.shape}")
-            logger.info(f"Target matrix shape: {Y.shape}")
-            
-            return X, Y, dates
-            
-        except ValueError as e:
-            logger.error(f"Error converting to arrays: {e}")
-            logger.error(f"Feature rows lengths: {[len(row) for row in feature_rows[:5]]}")
-            logger.error(f"Expected features per row: {len(feature_rows[0]) if feature_rows else 0}")
-            raise
+    # CRITICAL FIX: Only use dates where ALL ETFs have data
+    # This handles ETFs with shorter trading histories
+    ret = log_returns[avail]
     
-    def get_episode_data(
-        self, 
-        X: np.ndarray, 
-        Y: np.ndarray, 
-        dates: np.ndarray,
-        context_size: int,
-        query_size: int
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """
-        Sample a random episode for meta-training.
-        
-        Args:
-            X: Feature matrix
-            Y: Target matrix
-            dates: Array of dates
-            context_size: Number of context points
-            query_size: Number of query points
-            
-        Returns:
-            context_x, context_y, query_x, query_y
-        """
-        # Randomly select a start index
-        max_start = len(X) - context_size - query_size
-        if max_start <= 0:
-            raise ValueError("Not enough data for episode sampling")
-        
-        start_idx = np.random.randint(0, max_start)
-        
-        # Split into context and query
-        context_end = start_idx + context_size
-        query_end = context_end + query_size
-        
-        context_x = X[start_idx:context_end]
-        context_y = Y[start_idx:context_end]
-        query_x = X[context_end:query_end]
-        query_y = Y[context_end:query_end]
-        
-        return context_x, context_y, query_x, query_y
+    # Remove rows where ANY ETF has NaN (in case ffill didn't cover everything)
+    ret = ret.dropna()
+    
+    # Align macro data to the same dates
+    mac = macro_df.loc[ret.index].copy()
+    
+    # Global z-score macro to bring onto same scale as returns
+    mac = (mac - mac.mean()) / (mac.std() + 1e-8)
 
-# Factory function for backward compatibility
-def build_features(log_returns, macro_df, avail=None):
-    """Legacy function wrapper for meta_trainer.py compatibility"""
-    from config import config
-    dm = DataManager(config)
-    return dm.build_features(log_returns, macro_df, avail)
+    max_lag = max(config.LOOKBACK_LAGS + [config.ROLLING_MOM_WINDOW])
+    start = max_lag
 
-def get_episode_data(X, Y, dates, context_size, query_size):
-    """Legacy function wrapper for meta_trainer.py compatibility"""
-    from config import config
-    dm = DataManager(config)
-    return dm.get_episode_data(X, Y, dates, context_size, query_size)
+    feature_rows, target_rows, dates = [], [], []
+
+    for t in range(start, len(ret)):
+        row_feats = []
+
+        for tkr in avail:
+            r_series = ret[tkr].values
+
+            # Lagged returns
+            for lag in config.LOOKBACK_LAGS:
+                idx = t - lag
+                row_feats.append(r_series[idx] if idx >= 0 else 0.0)
+
+            # Rolling volatility
+            vol_window = r_series[max(0, t - config.ROLLING_VOL_WINDOW): t]
+            row_feats.append(float(vol_window.std()) if len(vol_window) > 1 else 0.0)
+
+            # Rolling momentum (annualised)
+            mom_window = r_series[max(0, t - config.ROLLING_MOM_WINDOW): t]
+            row_feats.append(float(mom_window.mean()) * 252 if len(mom_window) > 1 else 0.0)
+
+        # Macro features
+        mac_row = mac.iloc[t].values.tolist()
+        row_feats.extend(mac_row)
+
+        feature_rows.append(row_feats)
+        target_rows.append(ret.iloc[t].values.tolist())
+        dates.append(ret.index[t])
+
+    X = np.array(feature_rows, dtype=np.float32)
+    Y = np.array(target_rows, dtype=np.float32)
+
+    # Clip extreme values
+    X = np.clip(X, -10.0, 10.0)
+    Y = np.clip(Y, -0.20, 0.20)
+
+    return X, Y, pd.DatetimeIndex(dates)
+
+
+def make_episodes(
+    X: np.ndarray,
+    Y: np.ndarray,
+    dates: pd.DatetimeIndex,
+    n_episodes: int,
+    context_size: int,
+    query_size: int,
+    date_end: str,
+    date_start: str | None = None,
+    rng: np.random.Generator | None = None,
+) -> list[dict]:
+    """Sample random episodes from (X, Y) for meta-training.
+
+    Each episode:
+      context_x : (context_size, n_features)
+      context_y : (context_size, n_etf)
+      query_x   : (query_size,   n_features)
+      query_y   : (query_size,   n_etf)       ← target to predict
+
+    Episode construction:
+      - Sample a random start index i in [0, T - context_size - query_size]
+      - Context = rows i : i+context_size
+      - Query   = rows i+context_size : i+context_size+query_size
+      - Ensures no future leakage: query is strictly after context
+
+    Parameters
+    ----------
+    date_end   : only sample episodes that end before this date
+    date_start : only sample episodes that start after this date (optional)
+    """
+    if rng is None:
+        rng = np.random.default_rng(42)
+
+    end_ts   = pd.Timestamp(date_end)
+    start_ts = pd.Timestamp(date_start) if date_start else dates[0]
+
+    valid_starts = [
+        i for i in range(len(dates) - context_size - query_size)
+        if start_ts <= dates[i]
+        and dates[i + context_size + query_size - 1] <= end_ts
+    ]
+
+    if len(valid_starts) == 0:
+        raise ValueError(
+            f"No valid episode start indices found between {date_start} and {date_end}."
+        )
+
+    episodes = []
+    chosen   = rng.choice(
+        valid_starts,
+        size=min(n_episodes, len(valid_starts)),
+        replace=(n_episodes > len(valid_starts)),
+    )
+
+    for i in chosen:
+        c_end = i + context_size
+        q_end = c_end + query_size
+        episodes.append({
+            "context_x": X[i:c_end].copy(),
+            "context_y": Y[i:c_end].copy(),
+            "query_x":   X[c_end:q_end].copy(),
+            "query_y":   Y[c_end:q_end].copy(),
+        })
+
+    return episodes
