@@ -36,7 +36,7 @@ HF_TOKEN       = os.environ.get("HF_TOKEN", None)
 EQUITY_SECTORS_TICKERS = [
     "SPY", "QQQ", "XLK", "XLF", "XLE", "XLV", "XLB", "URA", "VUG", "VTV", "SPYG", "IWR", "VO", "VB", "VIG", "VEA", "VGT", "VDE", "XLC", "IBB",
     "XLI", "XLY", "XLP", "XLU", "GDX", "XME", "SMH", "SOXX", "IWD", "IWO", "VUG", "VTG", "SPYG", "QUAL", "IWR", "VO", "VB", "VIG", "VEA", "VGT", "VDE", "XLC",
-    "IWF", "XSD", "XBI", "IWM",
+    "IWF", "XSD", "XBI", "IWM", "CEPR", "COPX",
 ]
 FI_COMMODITIES_TICKERS = ["TLT", "VCIT", "LQD", "HYG", "VNQ", "GLD", "SLV"]
 COMBINED_TICKERS       = sorted(set(EQUITY_SECTORS_TICKERS + FI_COMMODITIES_TICKERS))
