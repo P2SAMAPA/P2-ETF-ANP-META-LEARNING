@@ -46,10 +46,28 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: pip
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Verify critical imports
+        run: |
+          echo "── Python interpreter ──"
+          python -c "import sys; print(sys.executable)"
+          python -c "import sys; print(sys.version)"
+          echo "── Package versions ──"
+          python -c "import pandas;  print('pandas ', pandas.__version__)"
+          python -c "import numpy;   print('numpy  ', numpy.__version__)"
+          python -c "import pyarrow; print('pyarrow', pyarrow.__version__)"
+          python -c "import torch;   print('torch  ', torch.__version__)"
+          echo "── Parquet round-trip test ──"
+          python -c "import pandas as pd, io; \
+            buf=io.BytesIO(); \
+            pd.DataFrame({'a':[1,2,3]}).to_parquet(buf, engine='pyarrow'); \
+            buf.seek(0); \
+            print(pd.read_parquet(buf, engine='pyarrow'))"
 
       - name: Run ANP meta-training — ${{ matrix.universe }}
         env:
